@@ -1,138 +1,183 @@
 import pandas as pd
+import numpy as np
 
-def _clean_km(val) -> str | None:
-    if pd.isna(val):
-        return None
-    s = str(val).strip()
-    if s.upper().startswith("EK"):
-        s = s[2:].strip()
-    return s
 
-def km_to_int(x: str) -> int | None:
+def pulley(filename_or_buffer: str):
     """
-    '58+913' -> 58913
-    '53+00'  -> 53000
-    Hatalı format varsa None döner.
+    Main purpose of this function to get all pulley with pulley_number, lenght and type
     """
-    if x is None or pd.isna(x):
-        return None
-    s = str(x).strip()
-    s = s.replace("EK", "").strip()
-    if "+" not in s:
-        return None
-    km, m = s.split("+", 1)
-    km = km.strip()
-    m = m.strip()
-    if not (km.isdigit() and m.isdigit()):
-        return None
-    m = m.zfill(3)
-    return int(km) * 1000 + int(m)
-
-def get_exist_pulley(filename_or_buffer: str):
     df = pd.read_excel(io=filename_or_buffer, sheet_name=1)
-
+    df = df.drop("KALAN (mt)", axis=1)
     df = df.rename(columns={
         "KABLO CİNSİ": "cable_type",
         "CORE": "core",
         "MAKARA NO": "pulley_number",
         "UZUNLUK (mt)": "lenght"
     })
-
-    df = df.drop('KALAN (mt)', axis=1)
-
-    df["cable_type"] = df["cable_type"].replace({
-        "A-DQ": "LSZH",
-        "A-DF": "PE"
-    })
+    df = df.replace("A-DQ", "LSZH")
+    df = df.replace("A-DF", "PE")
     return df
 
 
-def get_spread_table(filename_or_buffer: str):
+def spread(filename_or_buffer: str):
+    """
+    Main purpose of this function is get spreaded cable information systematicly
+    """
     df = pd.read_excel(io=filename_or_buffer, sheet_name=2)
-    df = df.drop(["Makara Uzunluğu", "Metraj Hatası", "Core Hatası", "Kılıf Hatası"], axis=1)
+
+    df = df.drop(["Metraj Hatası", "Core Hatası", "Kılıf Hatası"], axis=1)
     df = df.rename(columns={
         "Tarih": "date",
         "Bina": "building",
-        "Kablo Etiketi": "pulley_label", 
+        "Kablo Etiketi": "cable_ticket",
         "Nereden": "from",
         "Nereye": "to",
         "Kablo Tipi": "cable_type",
         "Makara Numarası": "pulley_number",
-        "Makara Başlangıç": "pulley_start",
-        "Makara Bitiş": "pulley_end",
-        "Başlangıç Elemanı": "starting_object",
-        "Başlangıç Km": "starting_km",
-        "Bitiş Elemanı": "ending_object",
-        "Bitiş Km": "ending_km",
+        "Makara Uzunluğu": "pulley_lenght",
+        "Makara Başlangıç": "pulley_start_lenght",
+        "Makara Bitiş": "pulley_end_lenght",
+        "Başlangıç Elemanı": "start_element",
+        "Başlangıç Km": "start_km",
+        "Bitiş Elemanı": "end_element",
+        "Bitiş Km": "end_km",
         "Hat 1 / Hat 2": "line_number",
-        "Ek Km": "supply_km",
-        "Makara Kalan Uzunluk": "remained_pulley",
-        "Serim(m)": "spread_meter"
+        "Ek Km": "attachment_km",
+        "Makara Kalan Uzunluk": "pulley_remain_lenght",
+        "Serim(m)": "spread_lenght"
     })
-
-    df["starting_km"] = df["starting_km"].apply(_clean_km)
-    df["ending_km"]   = df["ending_km"].apply(_clean_km)
-
-    df["starting_km_int"] = df["starting_km"].apply(km_to_int)
-    df["ending_km_int"]   = df["ending_km"].apply(km_to_int)
-
-    df = df.dropna(subset=["starting_km_int", "ending_km_int"])
-
+    # NaN -> None (JSON uyumu için iyi)
+    df = df.replace({np.nan: None})
     return df
 
 
+def attacments(df: pd.DataFrame) -> pd.DataFrame:
+    # start_km temizliği
+    cleaned_start = []
+    for km in df["start_km"]:
+        if km is None:
+            cleaned_start.append(None)
+            continue
 
-def build_splice_table(df: pd.DataFrame) -> pd.DataFrame:
+        s = str(km).strip()
+        s_lower = s.lower()
+
+        if "ek" in s_lower:          # "EK 56+990" -> "56+990"
+            parts = s.split()
+            s = parts[-1].strip()
+
+        if "+" in s:                 # "56+990" -> "56990"
+            s = s.replace("+", "")
+
+        cleaned_start.append(s)
+
+    df["start_km"] = cleaned_start
+
+    # end_km temizliği
+    cleaned_end = []
+    for km in df["end_km"]:
+        if km is None:
+            cleaned_end.append(None)
+            continue
+
+        s = str(km).strip()
+        s_lower = s.lower()
+
+        if "ek" in s_lower:
+            parts = s.split()
+            s = parts[-1].strip()
+
+        if "+" in s:
+            s = s.replace("+", "")
+
+        cleaned_end.append(s)
+
+    df["end_km"] = cleaned_end
+
+    # BAŞLANGIÇ > BİTİŞ OLANLARI SWAP ET
+    for idx in df.index:
+        sk = df.at[idx, "start_km"]
+        ek = df.at[idx, "end_km"]
+
+        if sk is None or ek is None:
+            continue
+
+        sk_str = str(sk)
+        ek_str = str(ek)
+
+        if sk_str.isdigit() and ek_str.isdigit():
+            sk_int = int(sk_str)
+            ek_int = int(ek_str)
+
+            if sk_int > ek_int:
+                # km'leri yer değiştir
+                df.at[idx, "start_km"], df.at[idx, "end_km"] = ek_str, sk_str
+
+                # Eğer km ile beraber eleman yönünü de düzeltmek istersen şunları aç:
+                # df.at[idx, "start_element"], df.at[idx, "end_element"] = \
+                #     df.at[idx, "end_element"], df.at[idx, "start_element"]
+
+    df["cable_type_raw"] = df["cable_type"]
+    df["jacket_type"] = df["cable_type_raw"].astype(str).str.contains(r"\(H\)").map({
+        True: "LSZH",
+        False: "PE"
+    })
+
+    # 24 F/O, 288 F/O -> 24 / 288
+    df["cable_type"] = (
+        df["cable_type"]
+        .astype(str)
+        .str.extract(r"(\d+)", expand=False)
+        .astype("Int64")
+    )
+
+    return df
+
+# functions.py
+
+def build_attachment_map(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Her km noktası için:
-      - down_pulleys: bu noktadan daha küçük km'ye giden kablolar
-      - up_pulleys  : bu noktadan daha büyük km'ye giden kablolar
+    Her satır:
+      line_number, cable_type (core), jacket_type (LSZH/PE), km_int, km
+    Hem başlangıç hem bitiş km'lerini nokta olarak ekler.
     """
-    all_points = set(df["starting_km_int"]).union(set(df["ending_km_int"]))
-    points_sorted = sorted(all_points)
+    rows: list[dict] = []
 
-    rows = []
+    for _, row in df.iterrows():
+        line = int(row["line_number"])
+        core = int(row["cable_type"])
+        jacket = row.get("jacket_type", None)
 
-    for p in points_sorted:
+        for col in ("start_km", "end_km"):
+            km_val = row[col]
+            if km_val is None:
+                continue
 
-        touch_mask = (df["starting_km_int"] == p) | (df["ending_km_int"] == p)
+            s = str(km_val)
+            if not s.isdigit():
+                continue
 
+            km_int = int(s)
+            km_km = km_int // 1000
+            km_m = km_int % 1000
+            km_label = f"{km_km}+{str(km_m).zfill(3)}"
 
-        down_mask = touch_mask & (
-            ((df["starting_km_int"] == p) & (df["ending_km_int"] < p)) |
-            ((df["ending_km_int"] == p) & (df["starting_km_int"] < p))
+            rows.append(
+                {
+                    "line_number": line,
+                    "cable_type": core,
+                    "jacket_type": jacket,
+                    "km_int": km_int,
+                    "km": km_label,
+                }
+            )
+
+    map_df = (
+        pd.DataFrame(rows)
+        .drop_duplicates(
+            subset=["line_number", "cable_type", "jacket_type", "km_int"]
         )
-        down_pulleys = (
-            df.loc[down_mask, "pulley_number"]
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-
-
-        up_mask = touch_mask & (
-            ((df["starting_km_int"] == p) & (df["ending_km_int"] > p)) |
-            ((df["ending_km_int"] == p) & (df["starting_km_int"] > p))
-        )
-        up_pulleys = (
-            df.loc[up_mask, "pulley_number"]
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-
-
-        km_str_candidates = df.loc[
-            touch_mask,
-            ["starting_km", "ending_km"]
-        ].values.ravel().tolist()
-        km_str_candidates = [x for x in km_str_candidates if isinstance(x, str)]
-        km_str = km_str_candidates[0] if km_str_candidates else None
-
-        rows.append({
-            "km_int": p,
-            "km": km_str,
-            "down_pulleys": ", ".join(down_pulleys) if down_pulleys else None,
-            "up_pulleys": ", ".join(up_pulleys) if up_pulleys else None,
-        })
-    return pd.DataFrame(rows)
+        .sort_values(["line_number", "cable_type", "km_int"])
+        .reset_index(drop=True)
+    )
+    return map_df
