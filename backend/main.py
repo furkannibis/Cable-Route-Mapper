@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from data.route import data_route
+from data.fiber_route import fiber_route
+from data.energy_route import energy_route
 
 app = FastAPI()
 
@@ -18,4 +19,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(data_route)
+app.include_router(fiber_route)
+app.include_router(energy_route)

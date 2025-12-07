@@ -8,6 +8,8 @@ class Cable():
             self.cable_sheat = "LSZH"
         elif cable_sheat == "A-DF":
             self.cable_sheat = "PE"
+        else:
+            self.cable_sheat = cable_sheat
         
         self.used_lenght = 0
         self.last_location = "Kullanılmadı"

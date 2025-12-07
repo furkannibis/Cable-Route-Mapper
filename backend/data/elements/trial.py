@@ -1,7 +1,6 @@
 from cable import FiberCable
 from deployment import DeploymentFiber, DeploymentPlanFiber
 from function import read_fiber_cable, find_correct_valley, read_deployment_241
-import pandas as pd
 
 fiber_cable = []
 for cable in read_fiber_cable():
@@ -36,7 +35,6 @@ for deployment in deployment_list:
 # for deployment in deploymentPlanFiber241.find_all_splice_points():
 #     print(deploymentPlanFiber241.find_splice_point(deployment))
 
-for x in deploymentPlanFiber241.splice_information():
-    pass
+
 
 # deploymentPlanFiber241.find_cable_information(cable_number="TUR06250845-1")
