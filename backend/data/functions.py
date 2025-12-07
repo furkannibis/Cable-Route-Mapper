@@ -94,7 +94,6 @@ def attacments(df: pd.DataFrame) -> pd.DataFrame:
 
     df["end_km"] = cleaned_end
 
-    # BAŞLANGIÇ > BİTİŞ OLANLARI SWAP ET
     for idx in df.index:
         sk = df.at[idx, "start_km"]
         ek = df.at[idx, "end_km"]
@@ -110,12 +109,7 @@ def attacments(df: pd.DataFrame) -> pd.DataFrame:
             ek_int = int(ek_str)
 
             if sk_int > ek_int:
-                # km'leri yer değiştir
                 df.at[idx, "start_km"], df.at[idx, "end_km"] = ek_str, sk_str
-
-                # Eğer km ile beraber eleman yönünü de düzeltmek istersen şunları aç:
-                # df.at[idx, "start_element"], df.at[idx, "end_element"] = \
-                #     df.at[idx, "end_element"], df.at[idx, "start_element"]
 
     df["cable_type_raw"] = df["cable_type"]
     df["jacket_type"] = df["cable_type_raw"].astype(str).str.contains(r"\(H\)").map({
@@ -123,7 +117,6 @@ def attacments(df: pd.DataFrame) -> pd.DataFrame:
         False: "PE"
     })
 
-    # 24 F/O, 288 F/O -> 24 / 288
     df["cable_type"] = (
         df["cable_type"]
         .astype(str)
