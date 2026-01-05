@@ -1,565 +1,761 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import {
-  getAttachmentMap,
-  postAttachment,
-  postSegment,
-  postPulley,
-  AttachmentMapItem,
-  AttachmentDetail,
-  SegmentDetail,
-  PulleyDetail,
-} from "@/api/api";
 
-type Segment = {
-  line_number: number;
-  cable_type: number;
-  jacket_type: string | null;
-  start_km_int: number;
-  end_km_int: number;
-  start_km_label: string;
-  end_km_label: string;
+/* ============================================================================
+   TYPES & HELPERS
+   ==========================================================================*/
+
+const BASE_URL = "http://127.0.0.1:8000";
+
+type Mode = "fiber24" | "fiber288" | "energy";
+type LineKey = "L1" | "L2";
+
+type RawCableInfo = {
+  "Cable Type": string;
+  "Cable Number": string;
+  "Cable Core Number"?: number | null;
+  "Cable Sheat Type": string;
+  "Cable Lenght": number;
+  "Cable Remain Lenght": number;
+  "Cable Used Lenght": number;
+  "Cable Last Location"?: string | null;
 };
 
+type RawSpliceItem = {
+  "Splice KM": number;
+  "Splice Lower Information": RawCableInfo | null;
+  "Splice Higher Information": RawCableInfo | null;
+};
+
+type CableSheath = "LSZH" | "PE" | "Energy";
+
+type CableInfo = {
+  type: string;
+  number: string;
+  core: number | null;
+  sheath: CableSheath;
+  length: number;
+  remain: number;
+  used: number;
+  lastLocation: string | null;
+};
+
+type Segment = {
+  id: string;
+  line: LineKey;
+  fromKm: number;
+  toKm: number;
+  cable: CableInfo;
+};
+
+type SplicePoint = {
+  line: LineKey;
+  km: number;
+};
+
+type LineData = {
+  line: LineKey;
+  splices: SplicePoint[];
+  segments: Segment[];
+};
+
+type MapData = {
+  L1: LineData | null;
+  L2: LineData | null;
+};
+
+type Selected =
+  | {
+      kind: "splice";
+      line: LineKey;
+      splice: SplicePoint;
+      segmentsAt: Segment[];
+    }
+  | {
+      kind: "segment";
+      line: LineKey;
+      segment: Segment;
+    };
+
+/** 52822 -> "52+822" */
+function formatKm(km: number): string {
+  const kmPart = Math.floor(km / 1000);
+  const mPart = km % 1000;
+  return `${kmPart}+${mPart.toString().padStart(3, "0")}`;
+}
+
+/** kılıf tipini normalize et */
+function normalizeSheath(raw: string, mode: Mode): CableSheath {
+  if (mode === "energy") return "Energy";
+  const up = raw.toUpperCase();
+  if (up.includes("LSZH") || up.includes("A-DQ")) return "LSZH";
+  return "PE";
+}
+
+function normalizeCable(info: RawCableInfo, mode: Mode): CableInfo {
+  return {
+    type: info["Cable Type"],
+    number: info["Cable Number"],
+    core:
+      info["Cable Core Number"] === undefined
+        ? null
+        : (info["Cable Core Number"] as number),
+    sheath: normalizeSheath(info["Cable Sheat Type"], mode),
+    length: info["Cable Lenght"],
+    remain: info["Cable Remain Lenght"],
+    used: info["Cable Used Lenght"],
+    lastLocation: info["Cable Last Location"] ?? null,
+  };
+}
+
+/** splice listesinden hat verisi üret */
+function buildLineData(
+  raw: RawSpliceItem[],
+  line: LineKey,
+  mode: Mode
+): LineData {
+  const sorted = [...raw].sort(
+    (a, b) => a["Splice KM"] - b["Splice KM"]
+  );
+
+  const splices: SplicePoint[] = sorted.map((r) => ({
+    line,
+    km: r["Splice KM"],
+  }));
+
+  const segments: Segment[] = [];
+
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const cur = sorted[i];
+    const next = sorted[i + 1];
+
+    const fromKm = cur["Splice KM"];
+    const toKm = next["Splice KM"];
+
+    const infoUp = cur["Splice Higher Information"];
+    const infoDown = next["Splice Lower Information"];
+    const chosen = infoUp ?? infoDown;
+    if (!chosen) continue;
+
+    const cable = normalizeCable(chosen, mode);
+
+    segments.push({
+      id: `${line}-${fromKm}-${toKm}-${cable.number}`,
+      line,
+      fromKm,
+      toKm,
+      cable,
+    });
+  }
+
+  return { line, splices, segments };
+}
+
+async function fetchLine(url: string): Promise<RawSpliceItem[]> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+  return res.json();
+}
+
+function urlsForMode(mode: Mode): { L1: string; L2: string } {
+  switch (mode) {
+    case "fiber24":
+      return { L1: `${BASE_URL}/fiber/241`, L2: `${BASE_URL}/fiber/242` };
+    case "fiber288":
+      return { L1: `${BASE_URL}/fiber/2881`, L2: `${BASE_URL}/fiber/2882` };
+    case "energy":
+      return { L1: `${BASE_URL}/energy/1`, L2: `${BASE_URL}/energy/2` };
+  }
+}
+
+/* ============================================================================
+   MAIN PAGE
+   ==========================================================================*/
+
 export default function Page() {
-  const [mapData, setMapData] = useState<AttachmentMapItem[]>([]);
+  const [mode, setMode] = useState<Mode>("energy");
+  const [mapData, setMapData] = useState<MapData>({ L1: null, L2: null });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [zoom, setZoom] = useState(150); // %
+  const [selected, setSelected] = useState<Selected | null>(null);
 
-  // Zoom
-  const [zoom, setZoom] = useState(1.0); // 0.5–2.0 arası
-
-  // Ek detayı
-  const [attachmentDetail, setAttachmentDetail] = useState<AttachmentDetail | null>(null);
-  const [attachmentLoading, setAttachmentLoading] = useState(false);
-  const [attachmentError, setAttachmentError] = useState<string | null>(null);
-
-  // Segment detayı
-  const [segmentDetail, setSegmentDetail] = useState<SegmentDetail | null>(null);
-  const [segmentLoading, setSegmentLoading] = useState(false);
-  const [segmentError, setSegmentError] = useState<string | null>(null);
-
-  // Pulley detayı
-  const [pulleyDetail, setPulleyDetail] = useState<PulleyDetail | null>(null);
-  const [pulleyLoading, setPulleyLoading] = useState(false);
-  const [pulleyError, setPulleyError] = useState<string | null>(null);
-
-  // ---------- DATA LOAD ----------
+  // Mode değişince veriyi çek
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       try {
         setLoading(true);
-        const data = await getAttachmentMap();
-        setMapData(data);
-      } catch (err: any) {
-        setError(err.message ?? "Map verisi alınamadı");
+        setError(null);
+
+        const urls = urlsForMode(mode);
+        const [rawL1, rawL2] = await Promise.all([
+          fetchLine(urls.L1),
+          fetchLine(urls.L2),
+        ]);
+
+        if (cancelled) return;
+
+        const L1 = rawL1.length ? buildLineData(rawL1, "L1", mode) : null;
+        const L2 = rawL2.length ? buildLineData(rawL2, "L2", mode) : null;
+
+        setMapData({ L1, L2 });
+        setSelected(null);
+      } catch (e: any) {
+        if (!cancelled) setError(e.message ?? "Veri alınamadı.");
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, []);
 
-  // Min / max km
-  const [minKm, maxKm] = useMemo(() => {
-    if (mapData.length === 0) return [0, 1];
-    const kms = mapData.map((m) => m.km_int);
-    return [Math.min(...kms), Math.max(...kms)];
+    return () => {
+      cancelled = true;
+    };
+  }, [mode]);
+
+  // min / max KM
+  const { minKm, maxKm } = useMemo(() => {
+    const kms: number[] = [];
+    (["L1", "L2"] as LineKey[]).forEach((key) => {
+      const d = mapData[key];
+      d?.splices.forEach((s) => kms.push(s.km));
+    });
+    if (!kms.length) return { minKm: 0, maxKm: 1 };
+    return { minKm: Math.min(...kms), maxKm: Math.max(...kms) };
   }, [mapData]);
 
-  const range = maxKm - minKm || 1;
+  const pxPerUnit = 0.06 * (zoom / 100);
+  const verticalPadding = 40;
+  const totalHeight =
+    (maxKm - minKm) * pxPerUnit + verticalPadding * 2 || 300;
 
-  // Line bazlı ayır
-  const line1Items = useMemo(
-    () => mapData.filter((m) => m.line_number === 1),
-    [mapData]
-  );
-  const line2Items = useMemo(
-    () => mapData.filter((m) => m.line_number === 2),
-    [mapData]
-  );
+  const activeLabel =
+    mode === "fiber24" ? "Fiber 24C" : mode === "fiber288" ? "Fiber 288C" : "Energy";
 
-  // ---------- SEGMENT HESABI ----------
-  const buildSegmentsForSet = (items: AttachmentMapItem[]): Segment[] => {
-    const segments: Segment[] = [];
-    const groups = new Map<string, AttachmentMapItem[]>();
+  const handleSpliceClick = (line: LineKey, km: number) => {
+    const lineData = mapData[line];
+    if (!lineData) return;
 
-    // line + cable_type + jacket_type ile grupla
-    for (const item of items) {
-      const key = `${item.line_number}-${item.cable_type}-${item.jacket_type ?? "UNK"}`;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key)!.push(item);
-    }
+    const splice: SplicePoint = { line, km };
+    const segmentsAt = lineData.segments.filter(
+      (s) => s.fromKm === km || s.toKm === km
+    );
 
-    for (const [, arr] of groups.entries()) {
-      const sorted = [...arr].sort((a, b) => a.km_int - b.km_int);
-
-      for (let i = 0; i < sorted.length - 1; i++) {
-        const a = sorted[i];
-        const b = sorted[i + 1];
-
-        segments.push({
-          line_number: a.line_number,
-          cable_type: a.cable_type,
-          jacket_type: a.jacket_type ?? null,
-          start_km_int: a.km_int,
-          end_km_int: b.km_int,
-          start_km_label: a.km,
-          end_km_label: b.km,
-        });
-      }
-    }
-
-    return segments;
+    setSelected({
+      kind: "splice",
+      line,
+      splice,
+      segmentsAt,
+    });
   };
 
-  // ---------- CLICK HANDLERS ----------
-  const resetDetails = () => {
-    setAttachmentDetail(null);
-    setAttachmentError(null);
-    setAttachmentLoading(false);
-
-    setSegmentDetail(null);
-    setSegmentError(null);
-    setSegmentLoading(false);
-
-    setPulleyDetail(null);
-    setPulleyError(null);
-    setPulleyLoading(false);
+  const handleSegmentClick = (line: LineKey, seg: Segment) => {
+    setSelected({ kind: "segment", line, segment: seg });
   };
 
-  const handlePointClick = async (item: AttachmentMapItem) => {
-    try {
-      resetDetails();
-      setAttachmentLoading(true);
+  return (
+    <>
+      <main className="min-h-screen w-full bg-slate-100 text-slate-900 flex">
+        {/* SIDEBAR */}
+        <aside className="w-64 border-r border-slate-200 bg-white flex flex-col">
+          <div className="p-4 pb-2 border-b border-slate-100">
+            <h1 className="text-lg font-semibold leading-tight">
+              Fiber / Energy Deployment
+            </h1>
+            <p className="mt-1 text-[11px] text-slate-500">
+              24 / 288 core fiber ve enerji kablolarının ek noktaları ve
+              aradaki kablo çekimleri.
+            </p>
+            <p className="mt-1 text-[11px]">
+              <span className="text-slate-500">Aktif: </span>
+              <span className="font-semibold">{activeLabel}</span>
+            </p>
+          </div>
 
-      const detail = await postAttachment(item.line_number, item.cable_type, item.km_int);
-      setAttachmentDetail(detail);
-    } catch (err: any) {
-      setAttachmentError(err.message ?? "Ek noktası bilgisi alınamadı");
-    } finally {
-      setAttachmentLoading(false);
-    }
-  };
-
-  const handleSegmentClick = async (seg: Segment) => {
-    try {
-      resetDetails();
-      setSegmentLoading(true);
-
-      const detail = await postSegment(
-        seg.line_number,
-        seg.cable_type,
-        seg.start_km_int,
-        seg.end_km_int
-      );
-      setSegmentDetail(detail);
-    } catch (err: any) {
-      setSegmentError(err.message ?? "Segment bilgisi alınamadı");
-    } finally {
-      setSegmentLoading(false);
-    }
-  };
-
-  const handlePulleyClick = async (pulleyNumber: string) => {
-    try {
-      setPulleyError(null);
-      setPulleyDetail(null);
-      setPulleyLoading(true);
-
-      const detail = await postPulley(pulleyNumber);
-      setPulleyDetail(detail);
-    } catch (err: any) {
-      setPulleyError(err.message ?? "Makara bilgisi alınamadı");
-    } finally {
-      setPulleyLoading(false);
-    }
-  };
-
-  // ---------- RENDER HELPERS ----------
-  const renderCapsule = (items: AttachmentMapItem[], segments: Segment[]) => {
-    return (
-      <div className="relative w-40 h-full rounded-full bg-slate-200 flex items-stretch justify-center overflow-hidden">
-        {/* Dikey ana hat – tam ortada */}
-        <div className="absolute top-10 bottom-10 left-1/2 -translate-x-1/2 w-[2px] bg-slate-400" />
-
-        {/* Kablo segmentleri (renkli bantlar) */}
-        {segments.map((seg, idx) => {
-          const y1 = ((seg.start_km_int - minKm) / range) * 100;
-          const y2 = ((seg.end_km_int - minKm) / range) * 100;
-          const heightPercent = (y2 - y1) * 0.8;
-          const mid = ((seg.start_km_int + seg.end_km_int) / 2 - minKm) / range * 100;
-
-          const bgColor =
-            seg.jacket_type === "LSZH"
-              ? "rgba(16,185,129,0.45)" // yeşil
-              : seg.jacket_type === "PE"
-              ? "rgba(249,115,22,0.45)" // turuncu
-              : "rgba(59,130,246,0.4)";
-
-          const label =
-            seg.jacket_type != null
-              ? `${seg.cable_type} ${seg.jacket_type}`
-              : `${seg.cable_type}`;
-
-          return (
-            <div key={`seg-${seg.line_number}-${seg.cable_type}-${seg.start_km_int}-${idx}`}>
-              {/* Segment bar – tam merkezde, tıklanabilir */}
-              <button
-                type="button"
-                className="absolute -translate-x-1/2 cursor-pointer group"
-                style={{
-                  left: "50%",
-                  top: `calc(${y1}% * 0.8 + 10%)`,
-                  height: `calc(${heightPercent}% )`,
-                  width: "10px",
-                  borderRadius: "9999px",
-                  backgroundColor: bgColor,
-                }}
-                onClick={() => handleSegmentClick(seg)}
-                title={`${seg.start_km_label} – ${seg.end_km_label}`}
-              />
-
-              {/* Segment etiketi – barın sağında */}
-              {heightPercent > 4 && (
-                <div
-                  className="absolute -translate-y-1/2 text-[11px] text-slate-800 font-medium whitespace-nowrap"
-                  style={{
-                    top: `calc(${mid}% * 0.8 + 10%)`,
-                    left: "calc(50% + 16px)",
-                  }}
+          <div className="p-4 pt-3 space-y-4 text-[11px]">
+            {/* MODE */}
+            <div>
+              <div className="mb-1 font-semibold">Katman</div>
+              <div className="flex flex-col gap-1">
+                <button
+                  onClick={() => setMode("fiber24")}
+                  className={`px-3 py-1 rounded-md border text-left ${
+                    mode === "fiber24"
+                      ? "bg-slate-900 text-white border-slate-900"
+                      : "bg-white hover:bg-slate-50 border-slate-200"
+                  }`}
                 >
-                  {label}
+                  Fiber 24C
+                </button>
+                <button
+                  onClick={() => setMode("fiber288")}
+                  className={`px-3 py-1 rounded-md border text-left ${
+                    mode === "fiber288"
+                      ? "bg-slate-900 text-white border-slate-900"
+                      : "bg-white hover:bg-slate-50 border-slate-200"
+                  }`}
+                >
+                  Fiber 288C
+                </button>
+                <button
+                  onClick={() => setMode("energy")}
+                  className={`px-3 py-1 rounded-md border text-left ${
+                    mode === "energy"
+                      ? "bg-slate-900 text-white border-slate-900"
+                      : "bg-white hover:bg-slate-50 border-slate-200"
+                  }`}
+                >
+                  Energy
+                </button>
+              </div>
+            </div>
+
+            {/* ZOOM */}
+            <div>
+              <div className="mb-1 font-semibold flex items-center justify-between">
+                <span>Zoom</span>
+                <span className="text-[10px] text-slate-500">
+                  {zoom}
+                  {"%"}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  className="h-6 w-6 rounded-full border border-slate-300 flex items-center justify-center text-xs"
+                  onClick={() =>
+                    setZoom((z) =>
+                      Math.max(60, Math.round((z - 20) / 10) * 10)
+                    )
+                  }
+                >
+                  -
+                </button>
+                <input
+                  type="range"
+                  min={60}
+                  max={300}
+                  step={10}
+                  value={zoom}
+                  onChange={(e) => setZoom(Number(e.target.value))}
+                  className="flex-1"
+                />
+                <button
+                  className="h-6 w-6 rounded-full border border-slate-300 flex items-center justify-center text-xs"
+                  onClick={() =>
+                    setZoom((z) =>
+                      Math.min(300, Math.round((z + 20) / 10) * 10)
+                    )
+                  }
+                >
+                  +
+                </button>
+              </div>
+            </div>
+
+            {/* LEGEND */}
+            <div>
+              <div className="mb-1 font-semibold">Tipler</div>
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                  <span>LSZH</span>
                 </div>
+                <div className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full bg-orange-500" />
+                  <span>PE</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="h-[2px] w-4 bg-slate-500" />
+                  <span>Hat</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="h-1.5 w-1.5 rounded-full bg-slate-800" />
+                  <span>Ek noktası</span>
+                </div>
+              </div>
+            </div>
+
+            <p className="text-[10px] text-slate-500 pt-2 border-t border-slate-200">
+              Detay görmek için sağdaki haritada bir ek noktasına veya kablo
+              segmentine tıklayın. Detaylar popup olarak açılır.
+            </p>
+          </div>
+        </aside>
+
+        {/* MAP AREA */}
+        <section className="flex-1 p-6 overflow-auto">
+          <div className="flex flex-col gap-4">
+            <div className="flex items-baseline justify-between">
+              <h2 className="text-sm font-semibold">Harita</h2>
+              {loading && (
+                <span className="text-[11px] text-slate-500">
+                  Yükleniyor...
+                </span>
+              )}
+              {error && (
+                <span className="text-[11px] text-red-600">
+                  Hata: {error}
+                </span>
               )}
             </div>
-          );
-        })}
 
-        {/* Ek noktaları (tek renk, tam merkezde) + yanında km etiketi */}
-        {items.map((item, idx) => {
-          const percent = ((item.km_int - minKm) / range) * 100;
-          const top = `calc(${percent}% * 0.8 + 10%)`;
-
-          return (
-            <div key={item.line_number + "-" + item.cable_type + "-" + item.km_int + "-" + idx}>
-              {/* Noktanın kendisi – çizgiyle tam aynı merkezde */}
-              <button
-                type="button"
-                className="absolute -translate-x-1/2 -translate-y-1/2"
-                style={{ left: "50%", top }}
-                onClick={() => handlePointClick(item)}
-              >
-                <div className="h-3.5 w-3.5 rounded-full shadow-md bg-slate-700 hover:scale-125 transition-transform" />
-              </button>
-
-              {/* Km etiketi – noktanın sağında */}
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 overflow-auto">
               <div
-                className="absolute -translate-y-1/2 text-[11px] text-slate-800"
-                style={{ left: "calc(50% + 12px)", top }}
+                className="flex gap-16 relative"
+                style={{ height: totalHeight }}
               >
-                {item.km}
+                {/* KM skalası (yukarı büyük, aşağı küçük) */}
+                <KmAxis
+                  minKm={minKm}
+                  maxKm={maxKm}
+                  pxPerUnit={pxPerUnit}
+                  verticalPadding={verticalPadding}
+                />
+
+                {/* Line 1 & Line 2 */}
+                <div className="flex-1 flex justify-center gap-40">
+                  <LineColumn
+                    label="Hat 1"
+                    lineKey="L1"
+                    data={mapData.L1}
+                    minKm={minKm}
+                    maxKm={maxKm}
+                    pxPerUnit={pxPerUnit}
+                    verticalPadding={verticalPadding}
+                    onSpliceClick={handleSpliceClick}
+                    onSegmentClick={handleSegmentClick}
+                  />
+                  <LineColumn
+                    label="Hat 2"
+                    lineKey="L2"
+                    data={mapData.L2}
+                    minKm={minKm}
+                    maxKm={maxKm}
+                    pxPerUnit={pxPerUnit}
+                    verticalPadding={verticalPadding}
+                    onSpliceClick={handleSpliceClick}
+                    onSegmentClick={handleSegmentClick}
+                  />
+                </div>
               </div>
             </div>
-          );
-        })}
+          </div>
+        </section>
+      </main>
+
+      {/* POPUP / MODAL */}
+      {selected && (
+        <Modal onClose={() => setSelected(null)}>
+          <DetailContent selected={selected} />
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/* ============================================================================
+   KM AXIS
+   ==========================================================================*/
+
+function KmAxis({
+  minKm,
+  maxKm,
+  pxPerUnit,
+  verticalPadding,
+}: {
+  minKm: number;
+  maxKm: number;
+  pxPerUnit: number;
+  verticalPadding: number;
+}) {
+  if (maxKm <= minKm) return null;
+
+  const range = maxKm - minKm;
+  const approxTicks = 8;
+  const rawStep = range / approxTicks;
+
+  const base = 500; // 0.5 km
+  const step = Math.max(base, Math.round(rawStep / base) * base);
+
+  const ticks: number[] = [];
+  for (let km = maxKm; km >= minKm; km -= step) {
+    ticks.push(km);
+  }
+
+  return (
+    <div className="w-16 relative text-[10px] text-slate-700">
+      {ticks.map((km) => {
+        const y = (maxKm - km) * pxPerUnit + verticalPadding;
+        return (
+          <div
+            key={km}
+            className="absolute left-0 -translate-y-1/2 flex items-center gap-1"
+            style={{ top: y }}
+          >
+            <span className="text-right w-10">{formatKm(km)}</span>
+            <span className="h-[1px] flex-1 bg-slate-300" />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ============================================================================
+   LINE COLUMN (HATLAR)
+   ==========================================================================*/
+
+interface LineColumnProps {
+  label: string;
+  lineKey: LineKey;
+  data: LineData | null;
+  minKm: number;
+  maxKm: number;
+  pxPerUnit: number;
+  verticalPadding: number;
+  onSpliceClick: (line: LineKey, km: number) => void;
+  onSegmentClick: (line: LineKey, seg: Segment) => void;
+}
+
+function LineColumn({
+  label,
+  lineKey,
+  data,
+  minKm,
+  maxKm,
+  pxPerUnit,
+  verticalPadding,
+  onSpliceClick,
+  onSegmentClick,
+}: LineColumnProps) {
+  return (
+    <div className="flex flex-col items-center text-[11px]">
+      <div className="mb-2 font-semibold">{label}</div>
+      <div className="relative w-32 h-full flex items-stretch justify-center">
+        {/* Arka plan capsule */}
+        <div className="absolute left-1/2 -translate-x-1/2 top-0 bottom-0 w-20 rounded-full bg-slate-100" />
+
+        {/* Ana hat */}
+        <div className="absolute left-1/2 -translate-x-1/2 top-4 bottom-4 w-[3px] bg-slate-500 rounded-full" />
+
+        {/* Segmentler */}
+        {data &&
+          data.segments.map((seg) => {
+            const topPx =
+              (maxKm - seg.toKm) * pxPerUnit + verticalPadding;
+            const bottomPx =
+              (maxKm - seg.fromKm) * pxPerUnit + verticalPadding;
+            const height = Math.max(8, bottomPx - topPx);
+
+            const colorClass =
+              seg.cable.sheath === "LSZH"
+                ? "bg-emerald-500"
+                : seg.cable.sheath === "PE"
+                ? "bg-orange-500"
+                : "bg-blue-500";
+
+            return (
+              <button
+                key={seg.id}
+                type="button"
+                className="absolute left-1/2 -translate-x-1/2 w-6 rounded-full shadow-sm hover:shadow-md transition-shadow border border-slate-200 flex flex-col items-center justify-center bg-white/70"
+                style={{ top: topPx, height }}
+                onClick={() => onSegmentClick(lineKey, seg)}
+              >
+                <div
+                  className={`w-[12px] rounded-full ${colorClass}`}
+                  style={{ height: height - 4 }}
+                />
+                <span className="absolute left-7 text-[9px] text-slate-700 whitespace-nowrap">
+                  {seg.cable.number}
+                </span>
+              </button>
+            );
+          })}
+
+        {/* Ek noktaları */}
+        {data &&
+          data.splices.map((sp, idx) => {
+            const y =
+              (maxKm - sp.km) * pxPerUnit + verticalPadding;
+            return (
+              <button
+                key={`${sp.km}-${idx}`}
+                type="button"
+                className="absolute left-1/2 -translate-x-1/2 -translate-y-1/2 h-2 w-2 rounded-full bg-slate-800 border border-slate-50 hover:scale-110 transition-transform"
+                style={{ top: y }}
+                onClick={() => onSpliceClick(lineKey, sp.km)}
+                title={formatKm(sp.km)}
+              />
+            );
+          })}
       </div>
-    );
-  };
+    </div>
+  );
+}
 
-  const renderLineColumn = (items: AttachmentMapItem[]) => {
-    const items24 = items.filter((it) => it.cable_type === 24);
-    const items288 = items.filter((it) => it.cable_type === 288);
+/* ============================================================================
+   MODAL & DETAIL CONTENT
+   ==========================================================================*/
 
-    const segments24 = buildSegmentsForSet(items24);
-    const segments288 = buildSegmentsForSet(items288);
+function Modal({
+  children,
+  onClose,
+}: {
+  children: React.ReactNode;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      {/* arka plan */}
+      <div
+        className="absolute inset-0 bg-black/40"
+        onClick={onClose}
+      />
+      {/* içerik */}
+      <div className="relative bg-white rounded-2xl shadow-xl max-w-xl w-full mx-4 p-4 border border-slate-200">
+        <button
+          type="button"
+          className="absolute right-3 top-3 h-6 w-6 rounded-full border border-slate-300 flex items-center justify-center text-xs text-slate-600 hover:bg-slate-100"
+          onClick={onClose}
+        >
+          ✕
+        </button>
+        {children}
+      </div>
+    </div>
+  );
+}
 
-    const baseHeight = 1400; // piksel cinsinden, sonra scale uygulanıyor
+function DetailContent({ selected }: { selected: Selected }) {
+  if (selected.kind === "segment") {
+    const { segment, line } = selected;
+    const c = segment.cable;
 
     return (
-      <div className="flex justify-center">
-        {/* zoom uygulanacak alanı saran kutu */}
-        <div className="relative max-h-[1400px] overflow-auto">
-          <div
-            className="relative flex items-stretch gap-8"
-            style={{
-              height: baseHeight,
-              transform: `scale(${zoom})`,
-              transformOrigin: "top center",
-            }}
-          >
-            <div className="flex flex-col items-center">
-              <span className="text-xs text-slate-600 mb-1">24 core</span>
-              {renderCapsule(items24, segments24)}
-            </div>
-            <div className="flex flex-col items-center">
-              <span className="text-xs text-slate-600 mb-1">288 core</span>
-              {renderCapsule(items288, segments288)}
-            </div>
-          </div>
+      <div className="text-[11px] space-y-1 pr-4 text-black">
+        <h3 className="text-sm font-semibold mb-2">
+          Kablo Segmenti – {line === "L1" ? "Line 1" : "Line 2"}
+        </h3>
+        <div>
+          <span className="font-medium">KM Aralığı:</span>{" "}
+          {formatKm(segment.fromKm)} – {formatKm(segment.toKm)}
         </div>
+        <div>
+          <span className="font-medium">Cable Number:</span> {c.number}
+        </div>
+        <div>
+          <span className="font-medium">Type:</span> {c.type}
+        </div>
+        {c.core !== null && (
+          <div>
+            <span className="font-medium">Core:</span> {c.core}
+          </div>
+        )}
+        <div>
+          <span className="font-medium">Sheath:</span> {c.sheath}
+        </div>
+        <div>
+          <span className="font-medium">Lenght:</span> {c.length} m
+        </div>
+        <div>
+          <span className="font-medium">Used:</span> {c.used} m
+        </div>
+        <div>
+          <span className="font-medium">Remain:</span> {c.remain} m
+        </div>
+        {c.lastLocation && (
+          <div>
+            <span className="font-medium">Last Location:</span>{" "}
+            {c.lastLocation}
+          </div>
+        )}
       </div>
     );
-  };
+  }
 
-  // ---------- POPUP ----------
-  const isPopupOpen =
-    attachmentLoading ||
-    attachmentDetail ||
-    attachmentError ||
-    segmentLoading ||
-    segmentDetail ||
-    segmentError ||
-    pulleyLoading ||
-    pulleyDetail ||
-    pulleyError;
+  const { splice, line, segmentsAt } = selected;
+  const incoming = segmentsAt.filter((s) => s.toKm === splice.km);
+  const outgoing = segmentsAt.filter((s) => s.fromKm === splice.km);
 
-  const closePopup = () => {
-    resetDetails();
-  };
-
-  // ---------- RENDER ----------
   return (
-    <main className="min-h-screen w-full bg-slate-100 text-slate-900 p-6 flex flex-col gap-6">
-      <header>
-        <h1 className="text-2xl font-bold mb-1">Fiber Ek Noktası Haritası</h1>
-      </header>
-
-      {/* Zoom bar */}
-      <div className="mt-1 mb-2 flex items-center gap-3 text-xs text-slate-700">
-        <span className="font-medium">Zoom:</span>
-        <button
-          type="button"
-          className="px-2 py-1 rounded border border-slate-300 hover:bg-slate-100"
-          onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.1).toFixed(2)))}
-        >
-          −
-        </button>
-        <input
-          type="range"
-          min={0.5}
-          max={1}
-          step={0.1}
-          value={zoom}
-          onChange={(e) => setZoom(parseFloat(e.target.value))}
-          className="w-40"
-        />
-        <button
-          type="button"
-          className="px-2 py-1 rounded border border-slate-300 hover:bg-slate-100"
-          onClick={() => setZoom((z) => Math.min(2, +(z + 0.1).toFixed(2)))}
-        >
-          +
-        </button>
-        <span className="w-10 text-right tabular-nums">
-          {(zoom * 100).toFixed(0)}%
-        </span>
+    <div className="text-[11px] space-y-2 pr-4 text-black">
+      <h3 className="text-sm font-semibold mb-2">
+        Ek Noktası – {line === "L1" ? "Line 1" : "Line 2"}
+      </h3>
+      <div>
+        <span className="font-medium">KM:</span> {formatKm(splice.km)}
       </div>
 
-      <section className="bg-white rounded-2xl shadow p-4 flex-1 flex flex-col gap-6">
-        {loading && <p className="text-sm text-slate-500">Yükleniyor...</p>}
-        {error && <p className="text-sm text-red-600">{error}</p>}
+      {incoming.length === 0 && outgoing.length === 0 && (
+        <p className="text-[10px] text-slate-500">
+          Bu ek noktasına bağlı kablo segmenti bulunamadı.
+        </p>
+      )}
 
-        {!loading && !error && mapData.length === 0 && (
-          <p className="text-sm text-slate-500">Veri bulunamadı.</p>
-        )}
-
-        {!loading && !error && mapData.length > 0 && (
-          <>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
-              <div>
-                <div className="text-sm font-semibold mb-3 text-center">Hat 1</div>
-                {renderLineColumn(line1Items)}
-              </div>
-              <div>
-                <div className="text-sm font-semibold mb-3 text-center">Hat 2</div>
-                {renderLineColumn(line2Items)}
-              </div>
-            </div>
-
-            {/* Legend */}
-            <div className="flex flex-wrap gap-4 text-xs justify-center mt-2">
-              <div className="flex items-center gap-1">
-                <span className="inline-block h-3.5 w-3.5 rounded-full bg-slate-700" />
-                <span>Ek noktası</span>
-              </div>
-              <div className="flex items-center gap-1">
-                <span className="inline-block h-2 w-6 rounded-full bg-emerald-400" />
-                <span>LSZH</span>
-              </div>
-              <div className="flex items-center gap-1">
-                <span className="inline-block h-2 w-6 rounded-full bg-orange-400" />
-                <span>PE</span>
-              </div>
-            </div>
-          </>
-        )}
-      </section>
-
-      {/* POPUP */}
-      {isPopupOpen && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
-          <div className="bg-white rounded-2xl shadow-lg p-4 w-full max-w-md text-sm max-h-[90vh] overflow-auto">
-            <div className="flex justify-between items-center mb-2">
-              <h2 className="font-semibold">
-                {segmentDetail
-                  ? "Ek Detay"
-                  : attachmentDetail
-                  ? "Ek Noktası Detayı"
-                  : "Detay"}
-              </h2>
-              <button
-                className="text-xs text-slate-500 hover:text-slate-800"
-                onClick={closePopup}
-              >
-                Kapat
-              </button>
-            </div>
-
-            {/* Ek detayı (segment yoksa) */}
-            {!segmentDetail && (
-              <>
-                {attachmentLoading && (
-                  <p className="text-slate-500">Ek bilgisi yükleniyor...</p>
-                )}
-                {attachmentError && <p className="text-red-600">{attachmentError}</p>}
-                {attachmentDetail && (
-                  <>
-                    <p>
-                      <span className="font-medium">Hat:</span>{" "}
-                      {attachmentDetail.line_number}
-                    </p>
-                    <p>
-                      <span className="font-medium">Km:</span> {attachmentDetail.km}
-                    </p>
-                    <p className="mt-2">
-                      <span className="font-medium">Azalan Makara:</span>{" "}
-                      {attachmentDetail.decreasing_pulley_number ? (
-                        <button
-                          type="button"
-                          className="text-sky-700 underline"
-                          onClick={() =>
-                            handlePulleyClick(
-                              attachmentDetail.decreasing_pulley_number as string
-                            )
-                          }
-                        >
-                          {attachmentDetail.decreasing_pulley_number}
-                        </button>
-                      ) : (
-                        "-"
-                      )}
-                    </p>
-                    <p>
-                      <span className="font-medium">Artan Makara:</span>{" "}
-                      {attachmentDetail.increasing_pulley_number ? (
-                        <button
-                          type="button"
-                          className="text-sky-700 underline"
-                          onClick={() =>
-                            handlePulleyClick(
-                              attachmentDetail.increasing_pulley_number as string
-                            )
-                          }
-                        >
-                          {attachmentDetail.increasing_pulley_number}
-                        </button>
-                      ) : (
-                        "-"
-                      )}
-                    </p>
-                  </>
-                )}
-              </>
-            )}
-
-            {/* Segment detayı */}
-            {segmentDetail && (
-              <>
-                {segmentLoading && (
-                  <p className="text-slate-500">Segment bilgisi yükleniyor...</p>
-                )}
-                {segmentError && <p className="text-red-600">{segmentError}</p>}
-                {!segmentLoading && !segmentError && (
-                  <>
-                    <p>
-                      <span className="font-medium">Hat:</span>{" "}
-                      {segmentDetail.line_number}
-                    </p>
-                    <p>
-                      <span className="font-medium">Core:</span>{" "}
-                      {segmentDetail.cable_type}
-                    </p>
-                    <p>
-                      <span className="font-medium">Km Aralığı:</span>{" "}
-                      {segmentDetail.start_km} – {segmentDetail.end_km}
-                    </p>
-                    <p className="mt-2">
-                      <span className="font-medium">Makaralar:</span>{" "}
-                      {segmentDetail.pulleys.length === 0 && "Yok"}
-                    </p>
-                    <ul className="list-disc list-inside">
-                      {segmentDetail.pulleys.map((p) => (
-                        <li key={p}>
-                          <button
-                            type="button"
-                            className="text-sky-700 underline"
-                            onClick={() => handlePulleyClick(p)}
-                          >
-                            {p}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  </>
-                )}
-              </>
-            )}
-
-            {/* Pulley detayı */}
-            {(pulleyLoading || pulleyDetail || pulleyError) && (
-              <div className="mt-4 border-t pt-3">
-                <h3 className="font-semibold mb-1 text-sm">Makara Detayı</h3>
-                {pulleyLoading && (
-                  <p className="text-slate-500">Makara bilgisi yükleniyor...</p>
-                )}
-                {pulleyError && <p className="text-red-600">{pulleyError}</p>}
-                {pulleyDetail && (
-                  <div className="space-y-1">
-                    <p>
-                      <span className="font-medium">Makara:</span>{" "}
-                      {pulleyDetail.pulley_number}
-                    </p>
-                    <p>
-                      <span className="font-medium">Tip:</span>{" "}
-                      {pulleyDetail.cable_type} / {pulleyDetail.core} core
-                    </p>
-                    <p>
-                      <span className="font-medium">Toplam:</span>{" "}
-                      {pulleyDetail.total_length} m
-                    </p>
-                    <p>
-                      <span className="font-medium">Kullanılan:</span>{" "}
-                      {pulleyDetail.used_length} m
-                    </p>
-                    <p>
-                      <span className="font-medium">Hesap Kalan:</span>{" "}
-                      {pulleyDetail.remaining_length_calculated} m
-                    </p>
-                    <p>
-                      <span className="font-medium">Son Konum:</span>{" "}
-                      {pulleyDetail.pulley_last_position ?? "-"}{" "}
-                      {pulleyDetail.pulley_last_km
-                        ? `(${pulleyDetail.pulley_last_km})`
-                        : ""}
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
+      {incoming.length > 0 && (
+        <div>
+          <div className="font-medium text-[11px] mb-1">
+            Azalan (gelen) kablo(lar)
           </div>
+          {incoming.map((seg) => (
+            <SpliceCableInfo key={seg.id} seg={seg} />
+          ))}
         </div>
       )}
-    </main>
+
+      {outgoing.length > 0 && (
+        <div>
+          <div className="font-medium text-[11px] mb-1">
+            Artan (giden) kablo(lar)
+          </div>
+          {outgoing.map((seg) => (
+            <SpliceCableInfo key={seg.id} seg={seg} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SpliceCableInfo({ seg }: { seg: Segment }) {
+  const c = seg.cable;
+  return (
+    <div className="border border-slate-200 rounded-md p-1.5 mb-1 space-y-0.5 text-[10px]">
+      <div>
+        <span className="font-medium">KM Aralığı:</span>{" "}
+        {formatKm(seg.fromKm)} – {formatKm(seg.toKm)}
+      </div>
+      <div>
+        <span className="font-medium">Cable Number:</span> {c.number}
+      </div>
+      <div>
+        <span className="font-medium">Type:</span> {c.type}
+      </div>
+      {c.core !== null && (
+        <div>
+          <span className="font-medium">Core:</span> {c.core}
+        </div>
+      )}
+      <div>
+        <span className="font-medium">Sheath:</span> {c.sheath}
+      </div>
+      <div>
+        <span className="font-medium">Lenght:</span> {c.length} m
+      </div>
+      <div>
+        <span className="font-medium">Used:</span> {c.used} m
+      </div>
+      <div>
+        <span className="font-medium">Remain:</span> {c.remain} m
+      </div>
+      {c.lastLocation && (
+        <div>
+          <span className="font-medium">Last Location:</span>{" "}
+          {c.lastLocation}
+        </div>
+      )}
+    </div>
   );
 }
